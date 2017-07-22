@@ -664,6 +664,40 @@ def max_pool(value, ksize, strides, padding, data_format="NHWC", name=None):
                                 data_format=data_format,
                                 name=name)
 
+def unpool(value, pooling_value, indices, ksize, strides, padding, data_format="NHWC", name=None):
+  """Performs the unpooling on the input  pooling on the input.
+
+  Args:
+    value: A 4-D `Tensor` with shape `[batch, height, width, channels]` and
+      type `tf.float32`.
+    pooling_value: A 4-D `Tensor` with shape `[batch, height, width, channels]` and
+      type `tf.float32`. The input of the corresponding pooling operation.
+    ksize: A list of ints that has length >= 4.  The size of the window for
+      each dimension of the input tensor. Should be identical to the ksize
+      of the corresponding pooling operation.
+    strides: A list of ints that has length >= 4.  The stride of the sliding
+      window for each dimension of the input tensor. Should be identical to the strides
+      of the corresponding pooling operation.
+    padding: A string, either `'VALID'` or `'SAME'`. The padding algorithm.
+      See the [comment here](https://www.tensorflow.org/api_docs/python/nn.html#convolution)
+      Should be identical to the padding of the corresponding pooling operation.
+    data_format: A string. Only 'NHWC' is supported.
+    name: Optional name for the operation.
+
+  Returns:
+    A `Tensor` with type `tf.float32`.  The max pooled output tensor.
+  """
+  with ops.name_scope(name, "Unpool", [value]) as name:
+    value = ops.convert_to_tensor(value, name="input")
+    return gen_nn_ops._unpool(pooling_value,
+                              value,
+                              indices,
+                              ksize=ksize,
+                              strides=strides,
+                              padding=padding,
+                              #data_format=data_format,
+                              name=name)
+
 
 ops.RegisterShape("Relu")(common_shapes.unchanged_shape)
 ops.RegisterShape("Relu6")(common_shapes.unchanged_shape)
@@ -842,11 +876,17 @@ def _DepthwiseConv2dNativeBackpropInputShape(op):
 
 @ops.RegisterShape("MaxPoolGrad")
 @ops.RegisterShape("MaxPoolGradWithArgmax")
+@ops.RegisterShape("Unpool")
 def _MaxPoolGradShape(op):
   """Shape function for the MaxPoolGrad op."""
   orig_input_shape = op.inputs[0].get_shape().with_rank(4)
   return [orig_input_shape]
 
+@ops.RegisterShape("UnpoolGrad")
+def _UnpoolGradShape(op):
+  """Shape function for the MaxPoolGrad op."""
+  orig_input_shape = op.inputs[1].get_shape().with_rank(4) # op.inputs[1] are the indices
+  return [orig_input_shape]
 
 @ops.RegisterStatistics("Conv2D", "flops")
 def _calc_conv_flops(graph, node):

@@ -19,6 +19,8 @@ limitations under the License.
 
 #include "tensorflow/core/kernels/maxpooling_op.h"
 
+#include <iostream>
+
 #include <vector>
 #include "third_party/eigen3/unsupported/Eigen/CXX11/Tensor"
 #include "tensorflow/core/common_runtime/device.h"
@@ -186,6 +188,150 @@ static void SpatialMaxPoolWithArgMaxHelper(
   Shard(worker_threads.num_threads, worker_threads.workers,
         params.tensor_in_batch, shard_cost, shard);
 }
+
+template <typename Device, typename T>
+static void SpatialMaxPoolWithArgMaxHelper2(OpKernelContext* context, Tensor* output, Tensor* _mask,
+                                const Tensor& tensor_in, const PoolParameters& params,
+                                const Padding& padding) {
+
+  T* data_in = (T*) tensor_in.flat<T>().data();
+  T* data_out = (T*) output->flat<T>().data();
+  int64* mask = _mask->flat<int64>().data();
+  
+  const DeviceBase::CpuWorkerThreads& worker_threads = *(context->device()->tensorflow_cpu_worker_threads());
+  
+  // To avoid locking and reach maximum parallelism, every thread is responsible
+  // for channels. This means the amount of shards to be done is in_batch * depth.
+  // Additionally the HWC-index is computed for the maximum and stored in mask
+  // which has the same dimensions like tensor_in and datatype int64.
+  auto shard = [&params, data_in, data_out, mask](int64 start, int64 limit) {
+    
+    const int32 depth = params.depth;
+    const int32 in_rows = params.tensor_in_rows;
+    const int32 in_cols = params.tensor_in_cols;
+    const int32 pad_rows = params.pad_rows;
+    const int32 pad_cols = params.pad_cols;
+    const int32 window_rows = params.window_rows;
+    const int32 window_cols = params.window_cols;
+    const int32 row_stride = params.row_stride;
+    const int32 col_stride = params.col_stride;
+    const int32 out_rows = params.out_height;
+    const int32 out_cols = params.out_width;
+    
+    std::cout << "range " << start << "-" << limit << std::endl;
+    
+    for (int32 i = start; i < limit; ++i) {
+      const int32 n = i / depth;
+      const int32 c = i % depth;
+      const int32 out_idx_base1 = n * out_rows;
+      
+      // initialize output channel to lowest possible value
+      for (int32 h = 0; h < out_rows; ++h) {
+        for (int32 w = 0; w < out_cols; ++w) {
+          data_out[((out_idx_base1 + h) * out_cols + w) * depth + c] = Eigen::NumTraits<T>::lowest();
+        }
+      }
+      
+      for (int32 h = 0; h < in_rows; ++h) {
+        for (int32 w = 0; w < in_cols; ++w) {
+          const int32 hpad = h + pad_rows;
+          const int32 wpad = w + pad_cols;
+          
+          // computing all output cells which are affected by [h,w] cell of input, in
+          // general that happens if the stride is less the window size in a dimension
+          const int32 h_start = (hpad < window_rows) ? 0 : (hpad - window_rows) / row_stride + 1;
+          const int32 h_end = std::min(hpad / row_stride + 1, out_rows);
+          const int32 w_start = (wpad < window_cols) ? 0 : (wpad - window_cols) / col_stride + 1;
+          const int32 w_end = std::min(wpad / col_stride + 1, out_cols);
+          
+          const int32 in_idx = ((n * in_rows + h) * in_cols + w) * depth + c;
+          const int32 in_idx_batch = (h * in_cols + w) * depth + c;
+          
+          //~ std::cout << "[in] b/h/w/c (idx) " << n << "/" << h << "/" << w << "/" << c << " (" << in_idx << "/" << in_idx_batch << ") " << " on [out] range " << h_start << "-" << h_end << "/" << w_start << "-" << w_end << std::endl;
+          
+          for (int32 ph = h_start; ph < h_end; ++ph) {
+            const int32 out_idx_base2 = (out_idx_base1 + ph) * out_cols;
+            
+            for (int32 pw = w_start; pw < w_end; ++pw) {
+              const int32 out_idx = (out_idx_base2 + pw) * depth + c;
+              
+              if (data_out[out_idx] < data_in[in_idx]){
+                data_out[out_idx] = data_in[in_idx];
+                mask[out_idx] = in_idx_batch; // store flattened index on batch (not globally flattened)
+                
+                //~ std::cout << "> argmax at " << in_idx_batch << std::endl;
+              }
+            }
+          }
+        }
+      }
+    }
+  };
+  
+  std::cout << "Using " << worker_threads.num_threads  << " threads" << std::endl;
+  
+  const int64 shard_total = params.tensor_in_batch * params.depth;
+  const int64 shard_cost = params.tensor_in_rows * params.tensor_in_cols;
+  Shard(worker_threads.num_threads, worker_threads.workers, shard_total, shard_cost, shard);
+}
+
+template <typename Device, typename T>
+static void UnpoolingHelper(OpKernelContext* context, Tensor* output, const Tensor& _mask,
+                            const Tensor& input, const PoolParameters& params, const Padding& padding) {
+    
+  T* data_in = (T*) input.flat<T>().data();
+  T* data_out = (T*) output->flat<T>().data();
+  int64* mask = (int64*) _mask.flat<int64>().data();
+  
+  const DeviceBase::CpuWorkerThreads& worker_threads = *(context->device()->tensorflow_cpu_worker_threads());
+  
+  // The amount of shards is again set to be in_batch * depth.
+  // It is a sparse operation, we iterate over the input / mask and place
+  // its values at the respective indices in the output.
+  auto shard = [&params, data_in, data_out, mask](int64 start, int64 limit) {
+    
+    const int32 depth = params.depth;
+    const int32 in_rows = params.tensor_in_rows;
+    const int32 in_cols = params.tensor_in_cols;
+    const int32 out_rows = params.out_height;
+    const int32 out_cols = params.out_width;
+    
+    std::cout << "range " << start << "-" << limit << std::endl;
+    
+    // in_rows, in_cols / out_rows, out_cols are inverted here, since we get the (forward) pooling
+    // parameters. E.g. the dimensions of the output channels are in_rows x in_cols.
+    for (int32 i = start; i < limit; ++i) {
+      const int32 n = i / depth;
+      const int32 c = i % depth;
+      const int32 batch_offset = n * in_rows * in_cols * depth;
+      
+      // initialize output channel to zero
+      for (int32 h = 0; h < in_rows; ++h) {
+        for (int32 w = 0; w < in_cols; ++w) {
+          //~ data_out[((n * out_rows + h) * out_cols + w) * depth + c] = T(0);
+          data_out[batch_offset + (h * in_cols + w) * depth + c] = T(0);
+        }
+      }
+      
+      // fill the given indices on the output channel with the input values
+      for (int32 h = 0; h < out_rows; ++h) {
+        for (int32 w = 0; w < out_cols; ++w) {
+          const int32 in_idx = ((n * out_rows + h) * out_cols + w) * depth + c;
+          const int32 out_idx = batch_offset + mask[in_idx];
+          
+          //~ std::cout << "[in] b/h/w/c (in_idx) " << n << "/" << h << "/" << w << "/" << c << " (" << in_idx << ") " << " on [out] batch / out_idx " << mask[in_idx] << "/" << out_idx << std::endl;
+          
+          data_out[out_idx] = data_in[in_idx];
+        }
+      }
+    }
+  };
+  
+  const int64 shard_total = params.tensor_in_batch * params.depth;
+  const int64 shard_cost = params.tensor_in_rows * params.tensor_in_cols;
+  Shard(worker_threads.num_threads, worker_threads.workers, shard_total, shard_cost, shard);
+}
+
 
 REGISTER_KERNEL_BUILDER(
     Name("MaxPool").Device(DEVICE_CPU).TypeConstraint<float>("T"),
@@ -505,16 +651,28 @@ class MaxPoolingWithArgmaxOp : public OpKernel {
     OP_REQUIRES_OK(context, context->allocate_output(0, out_shape, &output));
     Tensor* argmax = nullptr;
     OP_REQUIRES_OK(context, context->allocate_output(1, out_shape, &argmax));
-
-    LaunchMaxPoolingWithArgmax<Device, T>::launch(context, params, tensor_in,
-                                                  output, argmax);
+    
+#if GOOGLE_CUDA
+    if (std::is_same<Device, Eigen::GpuDevice>::value) {
+      LaunchMaxPoolingWithArgmax<Eigen::GpuDevice, T>::launch(context, params, tensor_in,
+                                                       output, argmax);
+    } else {
+#endif
+      
+      // if compilation is not done for gpu, this is the only option
+      SpatialMaxPoolWithArgMaxHelper2<CPUDevice, T>(context, output, argmax, tensor_in, params, padding_);
+    
+#if GOOGLE_CUDA
+    }
+#endif
   }
-
+  
  private:
   std::vector<int32> ksize_;
   std::vector<int32> stride_;
   Padding padding_;
 };
+
 
 template <typename Device, typename T>
 struct LaunchMaxPoolingGradWithArgmax;
@@ -556,6 +714,112 @@ class MaxPoolingGradWithArgmaxOp : public OpKernel {
 
     LaunchMaxPoolingGradWithArgmax<Device, T>::launch(context, params, grad_in,
                                                       argmax, grad_out);
+  }
+
+ private:
+  std::vector<int32> ksize_;
+  std::vector<int32> stride_;
+  Padding padding_;
+};
+
+
+template <typename Device, typename T>
+class UnpoolingOp : public OpKernel {
+ public:
+  explicit UnpoolingOp(OpKernelConstruction* context)
+      : OpKernel(context) {
+    OP_REQUIRES_OK(context, context->GetAttr("ksize", &ksize_));
+    OP_REQUIRES(context, ksize_.size() == 4,
+                errors::InvalidArgument("Sliding window ksize field must "
+                                        "specify 4 dimensions"));
+    OP_REQUIRES_OK(context, context->GetAttr("strides", &stride_));
+    OP_REQUIRES(context, stride_.size() == 4,
+                errors::InvalidArgument("Sliding window stride field must "
+                                        "specify 4 dimensions"));
+    OP_REQUIRES_OK(context, context->GetAttr("padding", &padding_));
+    OP_REQUIRES(context, ksize_[0] == 1 && stride_[0] == 1,
+                errors::Unimplemented(
+                    "Pooling is not yet supported on the batch dimension."));
+  }
+
+  void Compute(OpKernelContext* context) override {
+    const Tensor& input_pooling = context->input(0);
+    const Tensor& input = context->input(1);
+    const Tensor& indices = context->input(2);
+
+    PoolParameters params{context,  ksize_,      stride_,
+                          padding_, FORMAT_NHWC, input_pooling.shape()};
+    if (!context->status().ok()) {
+      return;
+    }
+
+    TensorShape out_shape({params.tensor_in_batch, params.tensor_in_rows,
+                           params.tensor_in_cols, params.depth});
+    Tensor* output = nullptr;
+    OP_REQUIRES_OK(context, context->allocate_output(0, out_shape, &output));
+    
+    
+#if GOOGLE_CUDA
+    if (std::is_same<Device, Eigen::GpuDevice>::value) {
+      // the cuda kernel for the MaxPoolingGradWithArgmax is actually more generic
+      // it simply upsamples based on the given (argmax) indices.
+      LaunchMaxPoolingGradWithArgmax<Eigen::GpuDevice, T>::launch(context, params, input, indices, output);
+    } else {
+#endif
+
+      // if compilation is not done for gpu, this is the only option
+      UnpoolingHelper<CPUDevice, T>(context, output, indices, input, params, padding_);
+    
+#if GOOGLE_CUDA
+    }
+#endif
+  }
+
+ private:
+  std::vector<int32> ksize_;
+  std::vector<int32> stride_;
+  Padding padding_;
+};
+
+template <typename Device, typename T>
+struct LaunchUnpoolingGrad;
+
+template <typename Device, typename T>
+class UnpoolingGradOp : public OpKernel {
+ public:
+  explicit UnpoolingGradOp(OpKernelConstruction* context)
+      : OpKernel(context) {
+    OP_REQUIRES_OK(context, context->GetAttr("ksize", &ksize_));
+    OP_REQUIRES(context, ksize_.size() == 4,
+                errors::InvalidArgument("Sliding window ksize field must "
+                                        "specify 4 dimensions"));
+    OP_REQUIRES_OK(context, context->GetAttr("strides", &stride_));
+    OP_REQUIRES(context, stride_.size() == 4,
+                errors::InvalidArgument("Sliding window stride field must "
+                                        "specify 4 dimensions"));
+    OP_REQUIRES_OK(context, context->GetAttr("padding", &padding_));
+    OP_REQUIRES(context, ksize_[0] == 1 && stride_[0] == 1,
+                errors::Unimplemented(
+                    "Pooling is not yet supported on the batch dimension."));
+  }
+
+  void Compute(OpKernelContext* context) override {
+    const Tensor& grad_in = context->input(0);
+    const Tensor& indices = context->input(1);
+    
+    PoolParameters params{context,  ksize_,      stride_,
+                          padding_, FORMAT_NHWC, grad_in.shape()};
+    if (!context->status().ok()) {
+      return;
+    }
+
+    TensorShape out_shape({params.tensor_in_batch, params.out_height,
+                           params.out_width, params.depth});
+    
+    Tensor* grad_out = nullptr;
+    OP_REQUIRES_OK(context, context->allocate_output(0, out_shape, &grad_out));
+    
+    LaunchUnpoolingGrad<Device, T>::launch(context, params, grad_in, indices, grad_out);
   }
 
  private:
@@ -716,6 +980,84 @@ REGISTER_KERNEL_BUILDER(
         .TypeConstraint<int64>("Targmax"),
     MaxPoolingGradWithArgmaxOp<Eigen::GpuDevice, Eigen::half>);
 
+template <typename T>
+struct LaunchUnpoolingGrad<Eigen::GpuDevice, T> {
+  static void launch(OpKernelContext* context, const PoolParameters& params,
+                     const Tensor& grad_in, const Tensor& indices,
+                     Tensor* grad_out) {
+    const int input_size = params.tensor_in_batch * params.tensor_in_rows *
+                           params.tensor_in_cols * params.depth;
+    const int output_size = params.tensor_in_batch * params.out_height *
+                            params.out_width * params.depth;
+    const int bottom_offset = params.out_height * params.out_width * params.depth;
+    const int top_offset = params.tensor_in_rows * params.tensor_in_cols * params.depth;
+    
+    bool status = UnpoolBackwardWithIndices(
+        output_size, input_size, grad_in.flat<T>().data(),
+        reinterpret_cast<const int64*>(indices.flat<int64>().data()), top_offset,
+        bottom_offset, grad_out->flat<T>().data(), context->eigen_gpu_device());
+    if (!status) {
+      context->SetStatus(
+          errors::Internal("Failed launching UnpoolBackward"));
+    }
+  }
+};
+
+REGISTER_KERNEL_BUILDER(
+    Name("UnpoolGrad")
+        .Device(DEVICE_GPU)
+        .TypeConstraint<float>("T")
+        .TypeConstraint<int64>("Targmax"),
+    UnpoolingGradOp<Eigen::GpuDevice, float>);
+REGISTER_KERNEL_BUILDER(
+    Name("UnpoolGrad")
+        .Device(DEVICE_GPU)
+        .TypeConstraint<Eigen::half>("T")
+        .TypeConstraint<int64>("Targmax"),
+    UnpoolingGradOp<Eigen::GpuDevice, Eigen::half>);
+
+
+REGISTER_KERNEL_BUILDER(
+    Name("Unpool")
+        .Device(DEVICE_GPU)
+        .TypeConstraint<float>("T")
+        .TypeConstraint<int64>("Targmax"),
+    UnpoolingOp<Eigen::GpuDevice, float>);
+REGISTER_KERNEL_BUILDER(
+    Name("Unpool")
+        .Device(DEVICE_GPU)
+        .TypeConstraint<Eigen::half>("T")
+        .TypeConstraint<int64>("Targmax"),
+    UnpoolingOp<Eigen::GpuDevice, Eigen::half>);
+
 #endif  // GOOGLE_CUDA
+
+
+// needs to be here so LaunchMaxPoolingWithArgmax is defined at time of compilation
+
+REGISTER_KERNEL_BUILDER(Name("MaxPoolWithArgmax")
+                            .Device(DEVICE_CPU)
+                            .TypeConstraint<int64>("Targmax")
+                            .TypeConstraint<float>("T"),
+                        MaxPoolingWithArgmaxOp<CPUDevice, float>);
+REGISTER_KERNEL_BUILDER(Name("MaxPoolWithArgmax")
+                            .Device(DEVICE_CPU)
+                            .TypeConstraint<int64>("Targmax")
+                            .TypeConstraint<Eigen::half>("T"),
+                        MaxPoolingWithArgmaxOp<CPUDevice, Eigen::half>);
+
+
+REGISTER_KERNEL_BUILDER(
+    Name("Unpool")
+        .Device(DEVICE_CPU)
+        .TypeConstraint<float>("T")
+        .TypeConstraint<int64>("Targmax"),
+    UnpoolingOp<CPUDevice, float>);
+REGISTER_KERNEL_BUILDER(
+    Name("Unpool")
+        .Device(DEVICE_CPU)
+        .TypeConstraint<Eigen::half>("T")
+        .TypeConstraint<int64>("Targmax"),
+    UnpoolingOp<CPUDevice, Eigen::half>);
 
 }  // namespace tensorflow

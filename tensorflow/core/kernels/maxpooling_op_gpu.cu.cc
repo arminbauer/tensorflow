@@ -199,6 +199,30 @@ __global__ void MaxPoolBackward(const int nthreads, const dtype* top_diff,
   }
 }
 
+// The parameters to the kernels in the backward function is as follows:
+//     nthreads: the number of threads, which is equal to the output size.
+//     top_diff: the gradient of the output data, of size N*Hout*Wout*C (or
+//        N*C*Hout*Wout). As we have stored the flattened index of the input
+//        entries, the backward function is agnostic of the input storage order.
+//     mask: the output mask of the same size as top_data. It is stored in
+//         int form, keeping track of the flattened index of the input item that
+//         produces the pooling output.
+//     top_offset: the pre-computed per-image offset of the maxpool output. This
+//         is equal to Hout*Wout*C. We choose to pre-compute this so we do not
+//         need to compute it every time inside the kernel.
+//     bottom_offset: the pre-computed per-image offset of the maxpool input.
+//         This is equal to H*W*C.
+//     bottom_diff: the gradient with respect to the input.
+template <typename dtype>
+__global__ void UnpoolBackward(const int nthreads, const dtype* top_diff,
+                               const int64* mask, const int top_offset,
+                               const int bottom_offset, dtype* bottom_diff) {
+  CUDA_1D_KERNEL_LOOP(index, nthreads) {
+    int image_id = (index / bottom_offset);
+    bottom_diff[index] = top_diff[image_id * top_offset + mask[index]];
+  }
+}
+
 #undef CUDA_1D_KERNEL_LOOP
 }  // namespace
 
@@ -310,6 +334,27 @@ bool MaxPoolBackwardWithArgmax(const int output_size, const int input_size,
       output_size, top_diff, mask, top_offset, bottom_offset, bottom_diff);
   return d.ok();
 }
+
+bool UnpoolBackwardWithIndices(const int output_size, const int input_size,
+                               const float* top_diff, const int64* mask,
+                               const int top_offset, const int bottom_offset,
+                               float* bottom_diff, const Eigen::GpuDevice& d) {
+  const int kThreadsPerBlock = 1024;
+  UnpoolBackward<<<(output_size + kThreadsPerBlock - 1) / kThreadsPerBlock, kThreadsPerBlock, 0, d.stream()>>>(
+      output_size, top_diff, mask, top_offset, bottom_offset, bottom_diff);
+  return d.ok();
+}
+
+bool UnpoolBackwardWithIndices(const int output_size, const int input_size,
+                               const Eigen::half* top_diff, const int64* mask,
+                               const int top_offset, const int bottom_offset,
+                               Eigen::half* bottom_diff, const Eigen::GpuDevice& d) {
+  const int kThreadsPerBlock = 1024;
+  UnpoolBackward<<<(output_size + kThreadsPerBlock - 1) / kThreadsPerBlock, kThreadsPerBlock, 0, d.stream()>>>(
+      output_size, top_diff, mask, top_offset, bottom_offset, bottom_diff);
+  return d.ok();
+}
+
 
 typedef Eigen::GpuDevice GPUDevice;
 
